@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Vision Pro Absolute - Direct Drive</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+        canvas { position: absolute; top: 0; left: 0; z-index: 2; }
+        
+        #ui-glass {
+            position: absolute; top: 20px; left: 20px; z-index: 10;
+            padding: 20px; border-radius: 20px; background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.2);
+            color: #00f2ff; width: 250px;
+        }
+
+        #camera-monitor {
+            position: absolute; bottom: 20px; right: 20px; width: 240px; height: 135px;
+            z-index: 10; border-radius: 15px; border: 2px solid #333;
+            transform: scaleX(-1); background: #111; object-fit: cover;
+        }
+
+        #debug-log { font-size: 10px; color: #aaa; margin-top: 10px; font-family: monospace; }
+        .instruction { font-size: 12px; color: #fff; margin-top: 5px; opacity: 0.8; }
+    </style>
+</head>
+<body>
+
+<div id="ui-glass">
+    <div style="font-size: 10px; letter-spacing: 2px; opacity: 0.6;">SYSTEM STATUS</div>
+    <div id="status" style="font-weight: bold; font-size: 18px;">INITIALIZING...</div>
+    <div class="instruction">🤏 Pinch to Write | 🖐️ Palm to Clear</div>
+    <div id="debug-log">Waiting for camera...</div>
+</div>
+
+<video id="input_video" playsinline style="display:none"></video>
+<video id="camera-monitor" autoplay playsinline></video>
+<canvas id="drawing-canvas"></canvas>
+
+<script>
+    const log = (msg) => { document.getElementById('debug-log').innerText = msg; console.log(msg); };
+    const status = (msg) => { document.getElementById('status').innerText = msg; };
+
+    const videoElement = document.getElementById('input_video');
+    const monitor = document.getElementById('camera-monitor');
+    const canvas = document.getElementById('drawing-canvas');
+    const ctx = canvas.getContext('2d', { desynchronized: true });
+
+    let isDrawing = false;
+    let lastX = 0, lastY = 0;
+
+    // --- ONE EURO FILTER (Zero-Lag Settings) ---
+    class OneEuroFilter {
+        constructor(f, m = 1.0, b = 0.8) {
+            this.f = f; this.m = m; this.b = b;
+            this.prevX = null; this.prevDX = 0;
+        }
+        filter(val) {
+            if (this.prevX === null) { this.prevX = val; return val; }
+            let dx = (val - this.prevX) * this.f;
+            let edx = this.prevDX + (this.alpha(1.0) * (dx - this.prevDX));
+            let cutoff = this.m + this.b * Math.abs(edx);
+            let x = this.prevX + (this.alpha(cutoff) * (val - this.prevX));
+            this.prevX = x; this.prevDX = edx;
+            return x;
+        }
+        alpha(cutoff) { let r = 2 * Math.PI * cutoff / this.f; return r / (r + 1); }
+    }
+
+    const fX = new OneEuroFilter(60);
+    const fY = new OneEuroFilter(60);
+
+    function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        ctx.fillStyle = "black";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // --- AI TRACKING ---
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.8, minTrackingConfidence: 0.8 });
+
+    hands.onResults((results) => {
+        status("ACTIVE");
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const marks = results.multiHandLandmarks[0];
+            const tip = marks[8];
+            const thumb = marks[4];
+
+            // 1. Direct Filtering
+            const rawX = (1 - tip.x) * canvas.width;
+            const rawY = tip.y * canvas.height;
+            const x = fX.filter(rawX);
+            const y = fY.filter(rawY);
+
+            const dist = Math.hypot(tip.x - thumb.x, tip.y - thumb.y);
+            const pinching = dist < 0.04;
+            const clearing = dist > 0.25;
+
+            if (clearing) { ctx.fillRect(0,0,canvas.width, canvas.height); }
+
+            if (pinching) {
+                ctx.strokeStyle = "#00f2ff";
+                ctx.lineWidth = 4;
+                ctx.lineCap = "round";
+                ctx.beginPath();
+                ctx.moveTo(isDrawing ? lastX : x, isDrawing ? lastY : y);
+                ctx.lineTo(x, y);
+                ctx.stroke();
+                isDrawing = true;
+            } else {
+                isDrawing = false;
+            }
+            lastX = x; lastY = y;
+        }
+    });
+
+    // --- ROBUST CAMERA INIT ---
+    async function startCamera() {
+        try {
+            log("Requesting Camera...");
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { width: 1280, height: 720, frameRate: 60 }
+            });
+            
+            videoElement.srcObject = stream;
+            monitor.srcObject = stream;
+            log("Camera Linked. Starting AI...");
+
+            const camera = new Camera(videoElement, {
+                onFrame: async () => { await hands.send({image: videoElement}); },
+                width: 1280, height: 720
+            });
+            camera.start();
+            status("READY");
+        } catch (err) {
+            log("ERROR: " + err.message);
+            status("CAMERA BLOCKED");
+        }
+    }
+
+    startCamera();
+</script>
+</body>
+</html>
